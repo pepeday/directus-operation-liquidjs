@@ -3,82 +3,80 @@ import { Liquid } from 'liquidjs';
 export default {
   id: 'use-liquid-templates',
   handler: async ({ collection, templateNameField, templateContentField, templateName, inputData }, { services, database, accountability, getSchema }) => {
+    const MAX_INCLUDE_DEPTH = 10;
+    const engine = new Liquid();
+    
     const { ItemsService } = services;
-
     const schema = await getSchema({ database });
     const templatesService = new ItemsService(collection, {
       schema: schema,
       accountability: accountability,
     });
 
-    const engine = new Liquid();
-
-    // Parse inputData to handle both JSON objects and strings
-    let parsedData;
-    try {
-      if (typeof inputData === 'string') {
-        parsedData = JSON.parse(inputData);
-      } else if (typeof inputData === 'object') {
-        parsedData = inputData;
-      } else {
-        throw new Error('Invalid input data format');
-      }
-    } catch (error) {
-      throw new Error('Invalid JSON provided in input data');
-    }
-
-    // Fetch the main template based on the provided templateName
-    let mainTemplate = await templatesService.readByQuery({
-      filter: {
-        [templateNameField]: templateName,
-      },
-      limit: 1,
-    });
-
-    if (!mainTemplate || mainTemplate.length === 0) {
-      throw new Error('Main template not found');
-    }
-
-    let templateContent = mainTemplate[0][templateContentField];
-
-    // Function to fetch and replace nested templates recursively
-    async function replaceIncludes(templateContent) {
-      const includeMatches = templateContent.match(/{% include '(\w+)' %}/g);
-
-      if (includeMatches) {
-        for (const match of includeMatches) {
-          const includedTemplateName = match.match(/'(\w+)'/)[1];
-
-          // Fetch the included template content dynamically
-          const includedTemplate = await templatesService.readByQuery({
-            filter: {
-              [templateNameField]: includedTemplateName,
-            },
-            limit: 1,
-          });
-
-          if (includedTemplate && includedTemplate.length > 0) {
-            const includedTemplateContent = includedTemplate[0][templateContentField];
-
-            // Recursively replace includes in the included template content
-            const processedContent = await replaceIncludes(includedTemplateContent);
-
-            // Replace the include tag with the processed content of the included template
-            templateContent = templateContent.replace(match, processedContent);
-          } else {
-            throw new Error(`Template '${includedTemplateName}' not found`);
-          }
+    const parseInputData = (data) => {
+      if (typeof data === 'object' && data !== null) return data;
+      if (typeof data === 'string') {
+        try {
+          return JSON.parse(data);
+        } catch (error) {
+          throw new Error('Invalid JSON provided in input data');
         }
       }
-      return templateContent;
+      throw new Error('Invalid input data format');
+    };
+
+    const fetchTemplate = async (name) => {
+      const template = await templatesService.readByQuery({
+        filter: { [templateNameField]: name },
+        limit: 1,
+      });
+
+      if (!template?.length) {
+        throw new Error(`Template '${name}' not found`);
+      }
+
+      return template[0][templateContentField];
+    };
+
+    const processIncludes = async (content, depth = 0) => {
+      if (depth >= MAX_INCLUDE_DEPTH) {
+        throw new Error(`Maximum template inclusion depth (${MAX_INCLUDE_DEPTH}) exceeded`);
+      }
+
+      const includeRegex = /{%\s*include\s+['"]([^'"]+)['"]\s*%}/g;
+      
+      // Process all includes at this level first
+      const replacements = new Map();
+      let match;
+      
+      // Gather all unique includes at this level
+      while ((match = includeRegex.exec(content)) !== null) {
+        const [fullMatch, templateName] = match;
+        if (!replacements.has(fullMatch)) {
+          const includedContent = await fetchTemplate(templateName);
+          const processedContent = await processIncludes(includedContent, depth + 1);
+          replacements.set(fullMatch, processedContent);
+        }
+      }
+
+      // Apply all replacements
+      let processedContent = content;
+      for (const [fullMatch, replacement] of replacements) {
+        processedContent = processedContent.replaceAll(fullMatch, replacement);
+      }
+
+      return processedContent;
+    };
+
+    try {
+      const parsedData = parseInputData(inputData);
+      const mainTemplate = await fetchTemplate(templateName);
+      const processedTemplate = await processIncludes(mainTemplate);
+      const renderedContent = await engine.parseAndRender(processedTemplate, parsedData);
+
+      return { renderedContent };
+    } catch (error) {
+      throw new Error(`Template processing failed: ${error.message}`);
     }
-
-    // Process the main template to replace all includes with their content
-    templateContent = await replaceIncludes(templateContent);
-
-    // Render the final processed template content
-    const renderedContent = await engine.parseAndRender(templateContent, parsedData);
-
-    return { renderedContent };
   },
 };
